@@ -1,10 +1,14 @@
-FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.51.0-jammy
 
+# Install any additional dependencies (if needed)
+# RUN pip install your-packages
+
+# Copy app files
+COPY . /app
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Expose port (if using uvicorn on 8000)
+EXPOSE 8000
 
-COPY . .
-
+# Run your FastAPI app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
