@@ -1,46 +1,48 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
+import requests
 from bs4 import BeautifulSoup
-import uvicorn
+import re
+import asyncio
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
 class ScrapeRequest(BaseModel):
-    url: str
-    max_pages: int = 10  # Optional for future pagination support
+    domain: str
+    max_pages: int
 
 @app.post("/scrape")
-async def scrape(request: ScrapeRequest):
+async def scrape(req: ScrapeRequest):
+    domain = req.domain
+    max_pages = req.max_pages
+
+    sitemap_url = f"https://{domain}/sitemap.xml"
+    sitemap = requests.get(sitemap_url).text
+    locs = re.findall(r"<loc>(https?://[^<]+)</loc>", sitemap)
+
+    urls = locs[:max_pages]
+    scraped_data = []
+
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page()
-        await page.goto(request.url, wait_until="domcontentloaded")
-        content = await page.content()
+
+        for url in urls:
+            await page.goto(url, wait_until="domcontentloaded")
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
+
+            data = {
+                "url": url,
+                "title": soup.title.string if soup.title else "",
+                "h1": [h.get_text(strip=True) for h in soup.find_all("h1")],
+                "h2": [h.get_text(strip=True) for h in soup.find_all("h2")],
+                "h3": [h.get_text(strip=True) for h in soup.find_all("h3")],
+                "p": [p.get_text(strip=True) for p in soup.find_all("p")],
+            }
+            scraped_data.append(data)
+
         await browser.close()
 
-        soup = BeautifulSoup(content, "html.parser")
-
-        structured = []
-        for tag in soup.find_all(["h1", "h2", "h3", "p", "table"]):
-            if tag.name == "table":
-                table_data = []
-                for row in tag.find_all("tr"):
-                    cells = [cell.get_text(strip=True) for cell in row.find_all(["td", "th"])]
-                    if cells:
-                        table_data.append(cells)
-                if table_data:
-                    structured.append({"type": "table", "content": table_data})
-            else:
-                text = tag.get_text(strip=True)
-                if text:
-                    structured.append({"type": tag.name, "content": text})
-
-        return {
-            "url": request.url,
-            "structured_data": structured
-        }
-
-# Optional if running locally
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"results": scraped_data}
