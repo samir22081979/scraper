@@ -1,13 +1,20 @@
-from fastapi import FastAPI, Request
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
+import re
+import json
+import asyncio
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright
 from collections import Counter
 import requests
-import re
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 app = FastAPI()
 
+# ──────────────
+# 🔧 CONFIG
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -15,10 +22,18 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+CONCURRENCY_LIMIT = 3
+semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-# ─────────────────────────────
-# Sitemap Discovery
+# ──────────────
+# 📦 Request Model
+class ScrapeRequest(BaseModel):
+    domain: str
+    max_pages: int = 50
 
+
+# ──────────────
+# 📌 Sitemap Discovery
 def find_sitemaps(domain):
     robots_url = f"https://{domain}/robots.txt"
     try:
@@ -29,6 +44,7 @@ def find_sitemaps(domain):
     except Exception:
         pass
     return [f"https://{domain}/sitemap.xml"]
+
 
 def fetch_sitemap_locs(smap_url):
     try:
@@ -44,68 +60,72 @@ def fetch_sitemap_locs(smap_url):
                 out += fetch_sitemap_locs(loc)
             return out
         return [u.text for u in root.findall("sm:url/sm:loc", ns)]
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Error parsing sitemap: {e}")
         return []
 
-# ─────────────────────────────
-# Scrape Page
 
+# ──────────────
+# 🧠 Playwright Scraper (Concurrent-safe)
 async def fetch_with_playwright(url):
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            content = await page.content()
-            await browser.close()
+    async with semaphore:
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                content = await page.content()
+                await browser.close()
 
-            soup = BeautifulSoup(content, "lxml")
-            return {
-                "url": url,
-                "title": soup.title.string.strip() if soup.title else "",
-                "h1": [h.get_text(strip=True) for h in soup.find_all("h1")],
-                "h2": [h.get_text(strip=True) for h in soup.find_all("h2")],
-                "h3": [h.get_text(strip=True) for h in soup.find_all("h3")],
-                "p": [p.get_text(strip=True) for p in soup.find_all("p")],
-            }
-    except Exception as e:
-        return {"url": url, "error": str(e)}
+                soup = BeautifulSoup(content, "lxml")
+                return {
+                    "url": url,
+                    "title": soup.title.string.strip() if soup.title else "",
+                    "h1": [h.get_text(strip=True) for h in soup.find_all("h1")],
+                    "h2": [h.get_text(strip=True) for h in soup.find_all("h2")],
+                    "h3": [h.get_text(strip=True) for h in soup.find_all("h3")],
+                    "paragraphs": [p.get_text(strip=True) for p in soup.find_all("p")]
+                }
+        except Exception as e:
+            print(f"❌ Failed to fetch {url}: {e}")
+            return {"url": url, "error": str(e)}
 
-# ─────────────────────────────
-# API Endpoint
 
-@app.post("/scrape")
-async def scrape(request: Request):
-    body = await request.json()
-    domain = body.get("domain")
-    max_pages = int(body.get("max_pages", 100))
+# ──────────────
+# 🧼 Clean Scraped Data
+def clean_scraped_data(results):
+    all_paragraphs = [p for page in results for p in page.get("paragraphs", [])]
+    freq = Counter(all_paragraphs)
 
-    sitemaps = find_sitemaps(domain)
-    all_urls = []
-    for sm in sitemaps:
-        urls = fetch_sitemap_locs(sm)
-        all_urls += urls
-    all_urls = list(set(all_urls))[:max_pages]
-
-    results = []
-    for url in all_urls:
-        data = await fetch_with_playwright(url)
-        results.append(data)
-
-    # Clean repeated paragraphs (optional)
-    paragraphs = [p for page in results for p in page.get("p", [])]
-    freq = Counter(paragraphs)
-
-    cleaned_results = []
+    cleaned = []
     for page in results:
-        unique_p = [p for p in page.get("p", []) if freq[p] <= 3]
-        cleaned_results.append({
-            "url": page["url"],
-            "title": page.get("title"),
+        cleaned.append({
+            "url": page.get("url"),
+            "title": page.get("title", ""),
             "h1": list(set(page.get("h1", []))),
             "h2": list(set(page.get("h2", []))),
             "h3": list(set(page.get("h3", []))),
-            "p": unique_p
+            "paragraphs": [p for p in page.get("paragraphs", []) if freq[p] <= 3]
         })
+    return cleaned
 
-    return {"results": cleaned_results}
+
+# ──────────────
+# 🚀 Endpoint
+@app.post("/scrape")
+async def scrape(request: ScrapeRequest):
+    domain = request.domain.replace("https://", "").replace("http://", "").strip("/")
+    max_pages = request.max_pages
+
+    sitemaps = find_sitemaps(domain)
+    urls = []
+    for smap in sitemaps:
+        urls += fetch_sitemap_locs(smap)
+
+    unique_urls = list(set(urls))[:max_pages]
+
+    tasks = [fetch_with_playwright(url) for url in unique_urls]
+    raw_results = await asyncio.gather(*tasks)
+
+    cleaned_results = clean_scraped_data(raw_results)
+    return JSONResponse(content={"results": cleaned_results})
